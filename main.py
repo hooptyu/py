@@ -9,9 +9,8 @@ st.set_page_config(page_title="大盘股价值筛查", layout="wide")
 st.title("🇺🇸 美股市值前200强：月度价值洼地监控")
 
 # --- 配置区 ---
-TICKER_CACHE = 'sp500_tickers.csv'
 RESULT_CACHE = 'scan_results_month.csv'
-TICKER_EXPIRY_DAYS = 180 # 名单半年更新一次
+TICKER_EXPIRY_DAYS = 180 
 
 # --- 逻辑 1：获取名单 (半年更新) ---
 @st.cache_data(ttl=TICKER_EXPIRY_DAYS * 86400)
@@ -30,11 +29,10 @@ def fetch_stock_data(tickers):
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total = 250 # 扫描前250只以确保覆盖市值前200
     
-    # 为了保证覆盖前200市值，取前250只进行扫描
-    total = 250
     for i, symbol in enumerate(tickers[:total]):
-        status_text.text(f"正在分析第 {i+1}/{total} 只: {symbol}...")
+        status_text.text(f"正在分析第 {i+1}/{total}: {symbol}...")
         try:
             t = yf.Ticker(symbol)
             info = t.info
@@ -49,62 +47,67 @@ def fetch_stock_data(tickers):
                     '市值(B)': round(mkt_cap / 1e9, 2),
                     'PE': round(pe, 2),
                     '股息率(%)': round(div * 100, 2) if div else 0,
-                    '更新日期': datetime.now().strftime('%Y-%m-%d')
+                    '更新日期': datetime.now().strftime('%Y-%m-%d'),
+                    '详情链接': f"https://finance.yahoo.com/quote/{symbol}"
                 })
         except:
             continue
         progress_bar.progress((i + 1) / total)
-    
-    status_text.text("✅ 扫描完成！")
     return pd.DataFrame(results)
 
 # --- 主程序逻辑 ---
 current_month = datetime.now().strftime('%Y-%m')
-needs_refresh = True
+final_df = pd.DataFrame()
 
-# 检查本地结果缓存
 if os.path.exists(RESULT_CACHE):
     cache_df = pd.read_csv(RESULT_CACHE)
-    if not cache_df.empty:
-        # 检查缓存数据中的日期是否是本月
-        cache_date = str(cache_df['更新日期'].iloc[0])
-        if cache_date.startswith(current_month):
-            needs_refresh = False
-            final_df = cache_df
-            st.success(f"📦 已加载 {current_month} 月份缓存数据，无需重复请求 API。")
+    if not cache_df.empty and str(cache_df['更新日期'].iloc[0]).startswith(current_month):
+        final_df = cache_df
+        st.success(f"📦 已加载 {current_month} 月份缓存数据")
 
-if needs_refresh:
-    if st.button('🚀 发现新月份或无缓存，立即开始全量扫描'):
+if final_df.empty:
+    if st.button('🚀 开始本月全量扫描'):
         tickers = get_sp500_list()
-        if tickers:
-            all_data = fetch_stock_data(tickers)
-            # 筛选逻辑
-            top200 = all_data.sort_values(by='市值(B)', ascending=False).head(200)
-            # 存入缓存
-            top200.to_csv(RESULT_CACHE, index=False)
-            final_df = top200
-            st.rerun()
-    else:
-        st.info("💡 点击上方按钮开始本月第一次数据采集（预计耗时2-3分钟）")
-        final_df = pd.DataFrame()
+        all_data = fetch_stock_data(tickers)
+        final_df = all_data.sort_values(by='市值(B)', ascending=False).head(200)
+        final_df.to_csv(RESULT_CACHE, index=False)
+        st.rerun()
 
 # --- 界面展示与筛选 ---
 if not final_df.empty:
-    st.sidebar.header("实时动态筛选")
+    # 侧边栏筛选
     max_pe = st.sidebar.slider("最高 PE", 5.0, 30.0, 20.0)
-    min_div = st.sidebar.slider("最低股息率 (%)", 0.0, 7.0, 2.5)
+    filtered_df = final_df[final_df['PE'] <= max_pe]
 
-    # 应用筛选
-    filtered_df = final_df[(final_df['PE'] <= max_pe) & (final_df['股息率(%)'] >= min_div)]
-    
-    st.write(f"### {current_month} 筛选出的便宜大蓝筹 ({len(filtered_df)} 只)")
-    st.dataframe(filtered_df.sort_values(by='PE'), use_container_width=True)
-
-    # 导出 CSV 按钮
-    csv = filtered_df.to_csv(index=False).encode('utf-8_sig')
-    st.download_button(
-        label="📥 导出结果到 CSV (可直接导入盈透)",
-        data=csv,
-        file_name=f'US_Cheap_Stocks_{current_month}.csv',
-        mime='text/csv',
+    # 使用 LinkColumn 让代码可跳转
+    st.write("### 筛选结果 (点击代码查看官方行情)")
+    st.dataframe(
+        filtered_df,
+        column_config={
+            "详情链接": st.column_config.LinkColumn("查看行情", display_text="Open Yahoo"),
+            "代码": st.column_config.TextColumn("代码")
+        },
+        use_container_width=True,
+        hide_index=True
     )
+
+    # --- 新功能：点击查看公司中文介绍 ---
+    st.divider()
+    st.subheader("🔍 公司详情深度查看 (中文)")
+    selected_ticker = st.selectbox("选择一只股票查看详细中文介绍：", filtered_df['代码'].unique())
+
+    if selected_ticker:
+        with st.spinner(f'正在获取 {selected_ticker} 的中文资料...'):
+            stock_obj = yf.Ticker(selected_ticker)
+            # 获取英文简介
+            desc_en = stock_obj.info.get('longBusinessSummary', '暂无介绍')
+            
+            # 使用简易接口翻译 (或显示英文并提示)
+            st.markdown(f"**公司名称:** {stock_obj.info.get('longName', selected_ticker)}")
+            st.markdown(f"**所属行业:** {stock_obj.info.get('sector', '未知')} - {stock_obj.info.get('industry', '未知')}")
+            
+            # 这里我们使用一个简单的技巧：Streamlit 的 st.expander 
+            with st.expander("点击查看公司业务简介"):
+                # 如果你在国内运行，可以接入百度/谷歌翻译API，这里先演示中文逻辑显示
+                st.write(desc_en)
+                st.info("💡 提示：以上简介由系统实时抓取。若需全中文版，建议在浏览器中使用右键'翻译成中文'查看。")
